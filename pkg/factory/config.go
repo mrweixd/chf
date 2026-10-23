@@ -88,6 +88,7 @@ type Configuration struct {
 	RfDiameter          *Diameter      `yaml:"rfDiameter,omitempty" valid:"required"`
 	AbmfDiameter        *Diameter      `yaml:"abmfDiameter,omitempty" valid:"required"`
 	Cgf                 *Cgf           `yaml:"cgf,omitempty" valid:"required"`
+	NrfNfInstanceId string `yaml:"nrfNfInstanceId,omitempty" valid:"optional,uuidv4"`
 }
 
 type Logger struct {
