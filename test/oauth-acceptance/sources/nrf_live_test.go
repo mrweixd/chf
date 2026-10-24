@@ -150,6 +150,7 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		secured, err := NewServer(app, "")
 		require.NoError(t, err)
 		endpoint := httptest.NewUnstartedServer(secured.router)
+		endpoint.EnableHTTP2 = true
 		endpoint.TLS = secured.httpServer.TLSConfig.Clone()
 		endpoint.StartTLS()
 		defer endpoint.Close()
