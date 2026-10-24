@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -69,7 +71,12 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 	}, 20*time.Second, 100*time.Millisecond)
 	rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	root, err := oauth.GenerateRootCertificate(filepath.Join(dir, "root.pem"), rootKey)
+	rootTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	require.NoError(t, err)
+	root, err := x509.ParseCertificate(rootDER)
 	require.NoError(t, err)
 	nrfKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -86,8 +93,12 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 	for _, kind := range []string{"CHF", "PCF", "NEF", "SMF", "SMSF", "AMF", "AF", "UDR", "AUSF"} {
 		id := uuid.NewString()
 		ids[kind] = id
-		_, err = oauth.GenerateCertificate(kind, id, oauth.GetNFCertPath(dir, kind, id), &nrfKey.PublicKey, root, rootKey)
-		require.NoError(t, err)
+		leaf, certErr := oauth.GenerateCertificate(kind, id, oauth.GetNFCertPath(dir, kind, id), &nrfKey.PublicKey, root, rootKey)
+		require.NoError(t, certErr)
+		roots := x509.NewCertPool()
+		roots.AddCert(root)
+		_, err = leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: kind})
+		require.NoError(t, err, "fixture certificate chain must verify without NRF's unknown-authority exception")
 		_, err = mongoapi.Client.Database(dbName).Collection(nrfctx.NfProfileCollName).InsertOne(context.Background(), bson.M{"nfInstanceId": id, "nfType": kind, "nfStatus": "REGISTERED"})
 		require.NoError(t, err)
 	}
