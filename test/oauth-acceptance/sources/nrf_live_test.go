@@ -117,7 +117,7 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		_, err = mongoapi.Client.Database(dbName).Collection(nrfctx.NfProfileCollName).InsertOne(context.Background(), bson.M{"nfInstanceId": id, "nfType": kind, "nfStatus": "REGISTERED"})
 		require.NoError(t, err)
 	}
-	cfg := &factory.Config{Configuration: &factory.Configuration{NfInstanceId: nrfID, Sbi: &factory.Sbi{Scheme: "http", BindingIPv4: "127.0.0.1", OAuth: true, NfCertBasePath: dir}, ServiceNameList: []string{"nnrf-nfm", "nnrf-disc"}}}
+	cfg := &factory.Config{Configuration: &factory.Configuration{NfInstanceId: nrfID, Sbi: &factory.Sbi{Scheme: "http", BindingIPv4: "127.0.0.1", RegisterIPv4: "127.0.0.1", Cert: &factory.Cert{Pem: certPath}, OAuth: true, NfCertBasePath: dir}, ServiceNameList: []string{"nnrf-nfm", "nnrf-disc"}}}
 	factory.NrfConfig = cfg
 	app := &liveNRFApp{cfg: cfg}
 	app.proc = &processor.Processor{ProcessorNrf: app}
