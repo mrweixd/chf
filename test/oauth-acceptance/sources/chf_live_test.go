@@ -1,6 +1,7 @@
 package sbi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -46,9 +47,35 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		require.True(t, known)
 		documents = append(documents, bson.M{"serviceInstanceId": uuid.NewString(), "serviceName": string(service), "nfServiceStatus": "REGISTERED", "allowedNfTypes": allowed})
 	}
-	result, err := collection.UpdateOne(t.Context(), bson.M{"nfInstanceId": producer}, bson.M{"$set": bson.M{"nfServices": documents}})
+	profile := map[string]interface{}{"nfInstanceId": producer, "nfType": "CHF", "nfStatus": "REGISTERED", "nfServices": documents}
+	profileJSON, err := json.Marshal(profile)
 	require.NoError(t, err)
-	require.EqualValues(t, 1, result.MatchedCount)
+	registerURL := endpoint + "/nnrf-nfm/v1/nf-instances/" + producer
+	registerReq, err := http.NewRequestWithContext(t.Context(), http.MethodPut, registerURL, bytes.NewReader(profileJSON))
+	require.NoError(t, err)
+	registerReq.Header.Set("Content-Type", "application/json")
+	registered, err := http.DefaultClient.Do(registerReq)
+	require.NoError(t, err)
+	registerBody, err := io.ReadAll(registered.Body)
+	require.NoError(t, err)
+	registered.Body.Close()
+	require.Equal(t, http.StatusCreated, registered.StatusCode, string(registerBody))
+	require.Equal(t, registerURL, registered.Header.Get("Location"))
+	var stored bson.M
+	require.NoError(t, collection.FindOne(t.Context(), bson.M{"nfInstanceId": producer}).Decode(&stored))
+	storedJSON, err := json.Marshal(stored["nfServices"])
+	require.NoError(t, err)
+	var savedServices []models.Nrf_NFMgmt_NFService
+	require.NoError(t, json.Unmarshal(storedJSON, &savedServices))
+	require.Len(t, savedServices, len(services))
+	for i, service := range services {
+		allowed, _ := nfctx.AllowedNfTypesForService(service)
+		require.Equal(t, service, savedServices[i].ServiceName)
+		require.Equal(t, allowed, savedServices[i].AllowedNfTypes)
+	}
+
+	t.Log("registration: 201, exact Location and persisted service policies verified")
+
 	// This exercises the NF's own token helper and the real NRF issuer identity.
 	nrfTokenCtx, pd, err := ctx.GetTokenCtxForNRF(models.Nrf_NFMgmt_ServiceName_NNRF_DISC)
 	require.NoError(t, err)
@@ -62,6 +89,34 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		return token.AccessToken
 	}
 	require.NoError(t, oauth.VerifyOAuth("Bearer "+tokenString(nrfTokenCtx), "nnrf-disc", oauth.AudiencePolicy{NFInstanceID: os.Getenv("OAUTH_NRF_ID")}, os.Getenv("OAUTH_NRF_ID"), cert))
+	discoveryURL := endpoint + "/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=CHF"
+	for _, authorized := range []bool{false, true} {
+		req, e := http.NewRequestWithContext(t.Context(), http.MethodGet, discoveryURL, nil)
+		require.NoError(t, e)
+		if authorized {
+			req.Header.Set("Authorization", "Bearer "+tokenString(nrfTokenCtx))
+		}
+		resp, e := http.DefaultClient.Do(req)
+		require.NoError(t, e)
+		body, e := io.ReadAll(resp.Body)
+		require.NoError(t, e)
+		resp.Body.Close()
+		if !authorized {
+			require.Equal(t, http.StatusUnauthorized, resp.StatusCode, string(body))
+			continue
+		}
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+		var found models.Nrf_NFDisc_SearchResult
+		require.NoError(t, json.Unmarshal(body, &found))
+		matched := false
+		for _, profile := range found.NfInstances {
+			if profile.NfInstanceId == producer {
+				matched = true
+			}
+		}
+		require.True(t, matched, "registered producer must be discoverable")
+	}
+	t.Log("discovery: 401 without token, 200 and registered producer with NRF token")
 	// Use actual NRF HTTP responses for denied requests, avoiding token caching.
 	rejected := func(requester, scope string) {
 		t.Helper()
