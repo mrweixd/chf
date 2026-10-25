@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -19,7 +18,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -152,30 +150,27 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		endpoint := httptest.NewUnstartedServer(secured.router)
 		endpoint.EnableHTTP2 = true
 		endpoint.TLS = secured.httpServer.TLSConfig.Clone()
+
+		serverTemplate := &x509.Certificate{SerialNumber: big.NewInt(999), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}}
+		serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, root, &nrfKey.PublicKey, rootKey)
+		require.NoError(t, err)
+		endpoint.TLS.Certificates = []tls.Certificate{{Certificate: [][]byte{serverDER}, PrivateKey: nrfKey}}
 		endpoint.StartTLS()
 		defer endpoint.Close()
-		// The existing shared OAuth client supplies no client certificate.
-		_, _, err = oauth.GetTokenCtx(oauth.TokenRequest{ConsumerNFType: models.Nrf_NFMgmt_NFType_CHF, ConsumerNFInstanceID: ids["CHF"], TargetNFType: models.Nrf_NFMgmt_NFType_NRF, TargetNFInstanceID: nrfID, NRFURI: endpoint.URL, Scope: "nnrf-disc"})
-		require.Error(t, err, "current default OAuth client must demonstrate the mTLS integration gap")
-		t.Logf("CONFIRMED BLOCKER: default OAuth client cannot obtain token over NRF mTLS: %v", err)
-		certPEM, err := os.ReadFile(oauth.GetNFCertPath(dir, "CHF", ids["CHF"]))
-		require.NoError(t, err)
-		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nrfKey)})
-		identity, err := tls.X509KeyPair(certPEM, keyPEM)
-		require.NoError(t, err)
-		trusted := endpoint.Client()
-		trusted.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{identity}
-		form := url.Values{"grant_type": {"client_credentials"}, "nfInstanceId": {ids["CHF"]}, "nfType": {"CHF"}, "targetNfType": {"NRF"}, "targetNfInstanceId": {nrfID}, "scope": {"nnrf-disc"}}
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint.URL+"/oauth2/token", strings.NewReader(form.Encode()))
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := trusted.Do(req)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
-		t.Log("mTLS control: trusted client certificate obtains token (200)")
+
+		keyPath := filepath.Join(dir, "client.key")
+		require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(nrfKey)}), 0600))
+		for _, nf := range []string{"chf", "pcf", "nef"} {
+			t.Run(nf, func(t *testing.T) {
+				kind := map[string]string{"chf": "CHF", "pcf": "PCF", "nef": "NEF"}[nf]
+				child := exec.Command(filepath.Join(os.Getenv("OAUTH_BIN_DIR"), nf+".test"), "-test.run=^TestLiveOAuthMTLS$", "-test.v", "-test.timeout=90s")
+				child.Env = append(os.Environ(), "OAUTH_MTLS_URL="+endpoint.URL, "OAUTH_NRF_CERT="+certPath, "OAUTH_CONSUMER_ID="+ids[kind], "OAUTH_CLIENT_CERT="+oauth.GetNFCertPath(dir, kind, ids[kind]), "OAUTH_CLIENT_KEY="+keyPath, "OAUTH_SERVER_CA="+filepath.Join(dir, "root.pem"))
+				output, err := child.CombinedOutput()
+				t.Log(string(output))
+				require.NoError(t, err)
+			})
+		}
+
 	})
 
 }

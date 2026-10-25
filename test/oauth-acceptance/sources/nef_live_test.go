@@ -200,3 +200,43 @@ func TestLiveOAuthAcceptance(t *testing.T) {
 		})
 	}
 }
+
+// Uses each NF's real token-context path with factory-loaded TLS configuration.
+func TestLiveOAuthMTLS(t *testing.T) {
+	endpoint := os.Getenv("OAUTH_MTLS_URL")
+	if endpoint == "" {
+		t.Skip("run from NRF acceptance harness")
+	}
+	producer, cert := os.Getenv("OAUTH_CONSUMER_ID"), os.Getenv("OAUTH_NRF_CERT")
+	cfg := &factory.Config{Configuration: &factory.Configuration{NrfUri: endpoint, NrfCertPem: cert,
+		OAuthTLS: &factory.OAuthTLS{Cert: os.Getenv("OAUTH_CLIENT_CERT"), Key: os.Getenv("OAUTH_CLIENT_KEY"), CA: os.Getenv("OAUTH_SERVER_CA")}}}
+	cfg.Configuration.NfInstanceId = producer
+	app := &callbackOAuthApp{cfg: cfg}
+	ctx, err := nfctx.NewContext(app)
+	require.NoError(t, err)
+	require.NoError(t, ctx.SetOAuth2Required(true))
+	client, err := cfg.NewOAuthHTTPClient()
+	require.NoError(t, err)
+	defer client.CloseIdleConnections()
+	ctx.OAuthHTTPClient = client
+	tokenCtx, pd, err := ctx.GetTokenCtxForNRF(models.Nrf_NFMgmt_ServiceName_NNRF_DISC)
+	require.NoError(t, err)
+	require.Nil(t, pd)
+	tok, err := tokenCtx.Value(openapi.ContextOAuth2).(oauth2.TokenSource).Token()
+	require.NoError(t, err)
+	require.NotEmpty(t, tok.AccessToken)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, endpoint+"/nnrf-disc/v1/nf-instances?target-nf-type=CHF&requester-nf-type=NEF", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	// A cached token must not hide the missing client certificate.
+	ctx.OAuthHTTPClient = nil
+	_, _, err = ctx.GetTokenCtxForNRF(models.Nrf_NFMgmt_ServiceName_NNRF_DISC)
+	require.Error(t, err)
+	t.Log("mTLS: NF token client obtains token, discovery returns 200, missing certificate rejected")
+}

@@ -12,16 +12,16 @@ clone_commit() {
  git -C "$run_dir/$name" checkout -q --detach FETCH_HEAD
  test "$(git -C "$run_dir/$name" rev-parse HEAD)" = "$sha"
 }
-clone_commit chf mrweixd/chf 39fbe2ac75b92a06a680148a63c9ec2b0e5b10b1
-clone_commit pcf mrweixd/pcf 3a47ab38665bf73f3f0b4bd529d23ed46b5d5f3c
-clone_commit nef mrweixd/nef 3dc3b37783f3e360e9c25d350f5893cd203af19b
+clone_commit chf mrweixd/chf ff4c923df6fd97f8557a177bbf69d59bd92e98b6
+clone_commit pcf mrweixd/pcf 31fbcbdef5fcb6f458a8a82611edf17399557035
+clone_commit nef mrweixd/nef 127cdc39c2f824d514892d3a4d6f011e5598d5dd
 clone_commit nrf Zach1113/nrf 68e575dc5584040484ef9e58f87b6a23bd392d99
 for nf in chf pcf nef nrf; do
  cp "$script_dir/sources/${nf}_live_test.go" "$run_dir/$nf/internal/sbi/oauth_live_acceptance_test.go"
 done
 (
  cd "$run_dir/nrf"
- go mod edit -replace=github.com/free5gc/openapi=github.com/ki225/openapi@v0.0.0-20261023075527-6c3ba053ced3
+ go mod edit -replace=github.com/free5gc/openapi=github.com/mrweixd/openapi@v0.0.0-20261025094827-bd904d23aed6
 )
 for nf in chf pcf nef; do
  (
