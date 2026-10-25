@@ -21,7 +21,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 )
 
-replace github.com/free5gc/openapi => github.com/ki225/openapi v0.0.0-20261023075527-6c3ba053ced3
+replace github.com/free5gc/openapi => github.com/mrweixd/openapi v0.0.0-20261025094827-bd904d23aed6
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.2.2

@@ -71,6 +71,10 @@ func NewApp(ctx context.Context, cfg *factory.Config, tlsKeyLogPath string) (*Ch
 	chf.ctx, chf.cancel = context.WithCancel(ctx)
 	chf.chfCtx = chf_context.GetSelf()
 
+	if chf.chfCtx.OAuthHTTPClient, err = cfg.NewOAuthHTTPClient(); err != nil {
+		return nil, err
+	}
+
 	if chf.sbiServer, err = sbi.NewServer(chf, tlsKeyLogPath); err != nil {
 		return nil, err
 	}

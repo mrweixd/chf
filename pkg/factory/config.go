@@ -69,6 +69,7 @@ type Info struct {
 }
 
 type Configuration struct {
+	OAuthTLS            *OAuthTLS      `yaml:"oauthTls,omitempty" valid:"optional"`
 	ReadIdleTimeout     *time.Duration `yaml:"readIdleTimeout,omitempty" valid:"optional"`
 	PingTimeout         *time.Duration `yaml:"pingTimeout,omitempty" valid:"optional"`
 	IdleTimeout         *time.Duration `yaml:"idleTimeout,omitempty" valid:"optional"`
