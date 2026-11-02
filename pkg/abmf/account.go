@@ -16,8 +16,7 @@ import (
 	cd "github.com/free5gc/chf/ccs_diameter/datatype"
 )
 
-// Keep the last accepted request for each accounting session on the account
-// document. Older sequence numbers must never be applied again.
+// The most recent result for a session also serves as its replay watermark.
 type receipt struct {
 	Number  int64
 	Action  int32
@@ -52,21 +51,43 @@ func account(ctx context.Context, coll *mongo.Collection, r *cd.AccountDebitRequ
 		Kind: int32(r.CcRequestType), Amount: int64(amount),
 	}
 	key := fmt.Sprintf("%x", sha256.Sum256([]byte(r.SessionId)))
-	field := "chfReceipts." + key
+	history := receiptHistory(coll)
 	id := bson.M{"ueId": "imsi-" + string(r.SubscriptionId.SubscriptionIdData), "ratingGroup": int64(m.RatingGroup)}
-	lookup := options.FindOne().SetProjection(bson.M{"quota": 1, field: 1}).
+	lookup := options.FindOne().SetProjection(bson.M{"quota": 1, "chfLatest": 1, "chfReceipts": 1}).
 		SetCollation(&options.Collation{Locale: "en_US", Strength: 2})
 	for {
 		var doc struct {
 			ID       any `bson:"_id"`
 			Quota    string
+			Latest   *sessionReceipt    `bson:"chfLatest"`
 			Receipts map[string]receipt `bson:"chfReceipts"`
 		}
 		err := coll.FindOne(ctx, id, lookup).Decode(&doc)
 		if err != nil {
 			return nil, err
 		}
-		prev, exists := doc.Receipts[key]
+		if len(doc.Receipts) > 0 {
+			if err = migrateReceipts(ctx, coll, history, doc.ID, doc.Receipts); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var prev receipt
+		exists := doc.Latest != nil && doc.Latest.Session == key
+		if exists {
+			prev = doc.Latest.Result
+		} else {
+			var saved struct{ Result receipt }
+			err = history.FindOne(ctx, receiptID(doc.ID, key)).Decode(&saved)
+			switch err {
+			case nil:
+				prev, exists = saved.Result, true
+			case mongo.ErrNoDocuments:
+			default:
+				return nil, err
+			}
+		}
+
 		if exists && want.Number <= prev.Number {
 			if want.Number != prev.Number || want.Action != prev.Action || want.Kind != prev.Kind || want.Amount != prev.Amount {
 				return nil, fmt.Errorf("stale or conflicting accounting request")
@@ -97,12 +118,21 @@ func account(ctx context.Context, coll *mongo.Collection, r *cd.AccountDebitRequ
 		// The balance and receipt become visible together. If another writer won,
 		// reread both before computing or returning a result.
 		match := bson.M{"_id": doc.ID, "quota": doc.Quota}
-		if exists {
-			match[field+".number"] = prev.Number
+		if doc.Latest == nil {
+			match["chfLatest"] = bson.M{"$exists": false}
 		} else {
-			match[field] = bson.M{"$exists": false}
+			match["chfLatest.session"] = doc.Latest.Session
+			match["chfLatest.result.number"] = doc.Latest.Result.Number
+			if doc.Latest.Session != key {
+				// Preserve the old watermark before evicting it. A crash between these
+				// writes leaves the same receipt in both locations and is safe to retry.
+				_, err = history.BulkWrite(ctx, []mongo.WriteModel{archiveReceipt(doc.ID, *doc.Latest)})
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
-		updates := bson.M{field: next, "quota": strconv.FormatInt(next.After, 10)}
+		updates := bson.M{"chfLatest": sessionReceipt{Session: key, Result: next}, "quota": strconv.FormatInt(next.After, 10)}
 		res, err := coll.UpdateOne(ctx, match, bson.M{"$set": updates})
 		if err != nil {
 			return nil, err
