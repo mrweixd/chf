@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"encoding/json"
 	"errors"
 	"math/big"
 	"testing"
@@ -190,4 +191,91 @@ func TestMissingDebitPrice(t *testing.T) {
 			return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{}}, nil
 		})
 	require.ErrorContains(t, err, "omitted Price")
+}
+
+func TestReleaseRetryAfterTariffChange(t *testing.T) {
+	self := ctx.GetSelf()
+	oldRF, oldAB := self.RatingCfg, self.AbmfCfg
+	self.RatingCfg, self.AbmfCfg = &sm.Settings{}, &sm.Settings{}
+	defer func() { self.RatingCfg, self.AbmfCfg = oldRF, oldAB }()
+	for _, test := range []struct {
+		name     string
+		reserved int64
+		want     int64
+	}{
+		{"debit", 0, 90}, {"refund", 20, 110},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const rg = 1
+			u := &ctx.ChfUe{
+				Supi: "imsi-replay", AcctSessionId: "acct",
+				ReservedQuota: map[int32]int64{rg: test.reserved}, RatingType: map[int32]cd.RequestSubType{},
+				AcctRequestNum: map[int32]uint32{}, UsageRemainder: map[int32]*big.Rat{},
+			}
+			self.UePool.Store(u.Supi, u)
+			defer self.UePool.Delete(u.Supi)
+			req := models.Chf_ConvCharging_ChargingDataRequest{
+				SubscriberIdentifier: u.Supi,
+				MultipleUnitUsage: []models.Chf_ConvCharging_MultipleUnitUsage{{
+					RatingGroup: rg,
+					UsedUnitContainer: []models.Chf_ConvCharging_UsedUnitContainer{{
+						TotalVolume:              1,
+						QuotaManagementIndicator: models.Chf_ConvCharging_QuotaManagementIndicator_ONLINE_CHARGING,
+					}},
+				}},
+			}
+			price := datatype.Unsigned32(10)
+			rfCalls := 0
+			rate := func(_ *ctx.ChfUe, _ *cd.ServiceUsageRequest) (*cd.ServiceUsageResponse, error) {
+				rfCalls++
+				p := price
+				return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{
+					Price: &p,
+					MonetaryTariff: &cd.MonetaryTariff{
+						RateElement: &cd.RateElement{UnitCost: &cd.UnitCost{ValueDigits: datatype.Integer64(p)}},
+					},
+				}}, nil
+			}
+			var original []byte
+			ledger := int64(100)
+			sends := 0
+			account := func(_ *ctx.ChfUe, r *cd.AccountDebitRequest) (*cd.AccountDebitResponse, error) {
+				sends++
+				wire, err := json.Marshal(r)
+				require.NoError(t, err)
+				if original != nil {
+					require.Equal(t, original, wire)
+					return &cd.AccountDebitResponse{}, nil
+				}
+				original = wire
+				m := r.MultipleServicesCreditControl
+				if r.RequestedAction == cd.REFUND_ACCOUNT {
+					ledger += int64(m.RequestedServiceUnit.CCTotalOctets)
+				} else {
+					ledger -= int64(m.UsedServiceUnit.CCTotalOctets)
+				}
+				return nil, errors.New("committed, answer lost")
+			}
+			settle := func(
+				entry models.Chf_ConvCharging_ChargingDataRequest, index int,
+			) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
+				return reserveEntry(entry, rate, account, "session", index)
+			}
+			_, problem := settleRelease(u, "session", req, settle)
+			require.NotNil(t, problem)
+			require.Equal(t, test.want, ledger)
+			before := rfCalls
+			price = 11
+			other, _ := reserveEntry(req, rate, account, "other-session", 0)
+			require.Equal(t, models.Chf_ConvCharging_ResultCode_RATING_FAILED, other[0].ResultCode)
+			progress, problem := settleRelease(u, "session", req, settle)
+			require.Nil(t, problem)
+			require.Equal(t, 1, progress.Next)
+			require.Equal(t, before, rfCalls)
+			require.Equal(t, 2, sends)
+			require.Equal(t, test.want, ledger)
+			require.Empty(t, u.PendingRelease)
+			require.Zero(t, u.ReservedQuota[rg])
+		})
+	}
 }

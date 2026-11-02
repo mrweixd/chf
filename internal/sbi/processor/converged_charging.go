@@ -23,6 +23,7 @@ import (
 	chf_context "github.com/free5gc/chf/internal/context"
 	"github.com/free5gc/chf/internal/logger"
 	"github.com/free5gc/chf/internal/rating"
+	"github.com/free5gc/chf/internal/tariff"
 	"github.com/free5gc/chf/internal/util"
 	Nchf_ConvergedCharging "github.com/free5gc/openapi/chf/ConvCharging"
 	"github.com/free5gc/openapi/models"
@@ -394,13 +395,7 @@ func (p *Processor) ChargingDataRelease(
 		func(
 			entry models.Chf_ConvCharging_ChargingDataRequest, index int,
 		) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
-			return reserveWithPeers(entry, rating.SendServiceUsageRequest, func(u *chf_context.ChfUe,
-				req *charging_datatype.AccountDebitRequest,
-			) (*charging_datatype.AccountDebitResponse, error) {
-				req.SessionId = datatype.UTF8String(u.AcctSessionId + ";release;" + chargingSessionId)
-				req.CcRequestNumber = datatype.Unsigned32(index)
-				return abmf.SendAccountDebitRequest(u, req)
-			})
+			return reserveEntry(entry, rating.SendServiceUsageRequest, abmf.SendAccountDebitRequest, chargingSessionId, index)
 		})
 	if problem != nil || progress.Finished {
 		return problem
@@ -510,11 +505,22 @@ func sessionChargingReservation(
 	return reserveWithPeers(chargingData, rating.SendServiceUsageRequest, abmf.SendAccountDebitRequest)
 }
 
-func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
-	rate func(*chf_context.ChfUe, *charging_datatype.ServiceUsageRequest) (*charging_datatype.ServiceUsageResponse, error),
-	debit func(
+type (
+	ratePeer func(
+		*chf_context.ChfUe, *charging_datatype.ServiceUsageRequest,
+	) (*charging_datatype.ServiceUsageResponse, error)
+	accountPeer func(
 		*chf_context.ChfUe, *charging_datatype.AccountDebitRequest,
-	) (*charging_datatype.AccountDebitResponse, error),
+	) (*charging_datatype.AccountDebitResponse, error)
+)
+
+func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest, rate ratePeer, debit accountPeer,
+) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
+	return reserveEntry(chargingData, rate, debit, "", -1)
+}
+
+func reserveEntry(chargingData models.Chf_ConvCharging_ChargingDataRequest, rate ratePeer, debit accountPeer,
+	session string, index int,
 ) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
 	var multipleUnitInformation []models.Chf_ConvCharging_MultipleUnitInformation
 	var partialRecord bool
@@ -561,6 +567,15 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 		finalSeen := false
 
 		rg := unitUsage.RatingGroup
+		pending := ue.PendingRelease[rg]
+		if pending != nil && (index < 0 || pending.Session != session ||
+			int64(pending.Request.CcRequestNumber) != int64(index)) {
+			// Another operation must not consume the reservation while settlement is unresolved.
+			multipleUnitInformation = append(multipleUnitInformation, models.Chf_ConvCharging_MultipleUnitInformation{
+				RatingGroup: rg, UPFID: unitUsage.UPFID, ResultCode: models.Chf_ConvCharging_ResultCode_RATING_FAILED,
+			})
+			continue
+		}
 		previousType, hadType := ue.RatingType[rg]
 		previousGroups := ue.RatingGroups
 		if !ue.FindRatingGroup(rg) {
@@ -668,9 +683,38 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 		send := func(req *charging_datatype.ServiceUsageRequest) (*charging_datatype.ServiceUsageResponse, error) {
 			return rate(ue, req)
 		}
+		quote := func() (tariff.Price, error) {
+			if pending != nil {
+				return pending.Price, nil
+			}
+			return getUnitCost(rg, sur, send)
+		}
+		unitsAt := func(price tariff.Price, units uint64, mode charging_datatype.RequestSubType) (int64, error) {
+			if pending != nil {
+				return pending.Units, nil
+			}
+			return ratedUnits(price, rg, sur, units, mode, send)
+		}
+		account := func(price tariff.Price, units int64) (*charging_datatype.AccountDebitResponse, error) {
+			if index < 0 {
+				return debit(ue, ccr)
+			}
+			if pending == nil {
+				ccr.SessionId = datatype.UTF8String(ue.AcctSessionId + ";release;" + session)
+				ccr.CcRequestNumber = datatype.Unsigned32(index)
+				pending = &chf_context.PendingRelease{Session: session, Request: ccr, Price: price, Units: units}
+				if ue.PendingRelease == nil {
+					ue.PendingRelease = make(map[int32]*chf_context.PendingRelease)
+				}
+				ue.PendingRelease[rg] = pending
+			}
+			// Peer routing fields may be filled by the transport on each send.
+			req := *pending.Request
+			return debit(ue, &req)
+		}
 		switch ue.RatingType[rg] {
 		case charging_datatype.REQ_SUBTYPE_RESERVE:
-			price, err := getUnitCost(rg, sur, send)
+			price, err := quote()
 			if err != nil {
 				failRating(err)
 				continue
@@ -686,7 +730,7 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 				continue
 			}
 			balance := ue.ReservedQuota[rg] - usedQuota
-			granted, err := ratedUnits(price, rg, sur, requested, charging_datatype.REQ_SUBTYPE_RESERVE, send)
+			granted, err := unitsAt(price, requested, charging_datatype.REQ_SUBTYPE_RESERVE)
 			if err != nil {
 				failRating(err)
 				continue
@@ -711,7 +755,7 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 					},
 				}
 
-				acctDebitRsp, debitErr := debit(ue, ccr)
+				acctDebitRsp, debitErr := account(price, granted)
 				if debitErr != nil {
 					failRating(debitErr)
 					continue
@@ -808,16 +852,17 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 
 		case charging_datatype.REQ_SUBTYPE_DEBIT:
 			logger.ChargingdataPostLog.Info("Debit mode, will not grant unit")
-			price, err := getUnitCost(rg, sur, send)
+			price, err := quote()
 			if err != nil {
 				failRating(err)
 				continue
 			}
-			finalPrice, err := ratedUnits(price, rg, sur, totalUsedUnit, charging_datatype.REQ_SUBTYPE_DEBIT, send)
+			finalPrice, err := unitsAt(price, totalUsedUnit, charging_datatype.REQ_SUBTYPE_DEBIT)
 			if err != nil {
 				failRating(err)
 				continue
 			}
+			ratedPrice := finalPrice
 			if carry := ue.UsageRemainder[rg]; carry != nil && carry.Sign() != 0 {
 				quoted, e := price.Charge(totalUsedUnit)
 				if e != nil || quoted != finalPrice {
@@ -864,7 +909,7 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 				}
 			}
 
-			_, err = debit(ue, ccr)
+			_, err = account(price, ratedPrice)
 			if err != nil {
 				failRating(err)
 				continue
@@ -886,6 +931,7 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 		}
 		multipleUnitInformation = append(multipleUnitInformation, unitInformation)
 
+		delete(ue.PendingRelease, rg)
 		ue.AcctRequestNum[rg]++
 	}
 

@@ -14,6 +14,7 @@ import (
 
 	charging_datatype "github.com/free5gc/chf/ccs_diameter/datatype"
 	"github.com/free5gc/chf/cdr/cdrType"
+	"github.com/free5gc/chf/internal/tariff"
 	"github.com/free5gc/chf/pkg/factory"
 )
 
@@ -24,10 +25,19 @@ type ReleaseProgress struct {
 	Finished    bool
 }
 
+// PendingRelease freezes the rating decisions used to construct Request.
+type PendingRelease struct {
+	Session string
+	Request *charging_datatype.AccountDebitRequest
+	Price   tariff.Price
+	Units   int64
+}
+
 type ChfUe struct {
-	Releases     map[string]*ReleaseProgress
-	Supi         string
-	RatingGroups []int32
+	PendingRelease map[int32]*PendingRelease
+	Releases       map[string]*ReleaseProgress
+	Supi           string
+	RatingGroups   []int32
 
 	QuotaValidityTime    int32
 	VolumeLimit          int32
