@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -385,14 +386,14 @@ func (p *Processor) ChargingDataRelease(
 	ue.CULock.Lock()
 	defer ue.CULock.Unlock()
 
-	units, _ := sessionChargingReservation(chargingData)
-	for _, u := range units {
-		if u.ResultCode == models.Chf_ConvCharging_ResultCode_RATING_FAILED {
-			return &models.ProblemDetails{Status: http.StatusInternalServerError, Cause: "RATING_FAILED"}
-		}
-	}
-
 	cdr := ue.Cdr[chargingSessionId]
+	if cdr == nil {
+		return &models.ProblemDetails{Status: http.StatusNotFound, Cause: "CONTEXT_NOT_FOUND"}
+	}
+	progress, problem := settleRelease(ue, chargingSessionId, chargingData, sessionChargingReservation)
+	if problem != nil || progress.Finished {
+		return problem
+	}
 
 	err := p.UpdateCDR(cdr, chargingData)
 	if err != nil {
@@ -419,7 +420,43 @@ func (p *Processor) ChargingDataRelease(
 		return problemDetails
 	}
 
+	progress.Finished = true
 	return nil
+}
+
+// Called under CULock. Advance only after this entry has been settled.
+// Keep the cursor through CDR finalization so retrying cannot repeat a debit.
+func settleRelease(ue *chf_context.ChfUe, session string, req models.Chf_ConvCharging_ChargingDataRequest,
+	settle func(models.Chf_ConvCharging_ChargingDataRequest) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool),
+) (*chf_context.ReleaseProgress, *models.ProblemDetails) {
+	key, err := json.Marshal([]any{req.InvocationSequenceNumber, req.MultipleUnitUsage, req.Triggers})
+	if err != nil {
+		return nil, &models.ProblemDetails{Status: http.StatusBadRequest}
+	}
+	digest := sha256.Sum256(key)
+	if ue.Releases == nil {
+		ue.Releases = make(map[string]*chf_context.ReleaseProgress)
+	}
+	p := ue.Releases[session]
+	if p == nil {
+		p = &chf_context.ReleaseProgress{Fingerprint: digest}
+		ue.Releases[session] = p
+	}
+	if p.Fingerprint != digest {
+		return nil, &models.ProblemDetails{Status: http.StatusConflict, Cause: "CONFLICTING_REQUEST"}
+	}
+	entries := req.MultipleUnitUsage
+	for p.Next < len(entries) {
+		req.MultipleUnitUsage = entries[p.Next : p.Next+1]
+		units, _ := settle(req)
+		for _, u := range units {
+			if u.ResultCode == models.Chf_ConvCharging_ResultCode_RATING_FAILED {
+				return nil, &models.ProblemDetails{Status: http.StatusInternalServerError, Cause: "RATING_FAILED"}
+			}
+		}
+		p.Next++
+	}
+	return p, nil
 }
 
 func (p *Processor) BuildOnlineChargingDataCreateResopone(

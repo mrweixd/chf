@@ -10,7 +10,7 @@ type ServiceRating struct {
 	ServiceInformation             diam_datatype.Grouped          `avp:"ServiceInformation"`
 	Extension                      diam_datatype.Grouped          `avp:"Extension"`
 	RequestSubType                 RequestSubType                 `avp:"RequestSubType"`
-	Price                          diam_datatype.Unsigned32       `avp:"Price"`
+	Price                          *diam_datatype.Unsigned32      `avp:"Price"`
 	BillingInfo                    diam_datatype.UTF8String       `avp:"BillingInfo"`
 	ImpactOnCounter                *diam_datatype.Grouped         `avp:"ImpactonCounter"`
 	RequestedUnits                 diam_datatype.Unsigned32       `avp:"RequestedUnits"`

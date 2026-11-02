@@ -121,9 +121,73 @@ func TestLargeFinalDebit(t *testing.T) {
 	total, err := ratedUnits(price, 1, &cd.ServiceUsageRequest{}, 5_000_000_000, cd.REQ_SUBTYPE_DEBIT,
 		func(req *cd.ServiceUsageRequest) (*cd.ServiceUsageResponse, error) {
 			calls++
-			return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{Price: req.ServiceRating.ConsumedUnits}}, nil
+			return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{Price: &req.ServiceRating.ConsumedUnits}}, nil
 		})
 	require.NoError(t, err)
 	require.EqualValues(t, 5_000_000_000, total)
 	require.Equal(t, 2, calls)
+}
+
+func TestReleaseRetry(t *testing.T) {
+	self := ctx.GetSelf()
+	oldRF, oldAB := self.RatingCfg, self.AbmfCfg
+	self.RatingCfg, self.AbmfCfg = &sm.Settings{}, &sm.Settings{}
+	defer func() { self.RatingCfg, self.AbmfCfg = oldRF, oldAB }()
+	ue := &ctx.ChfUe{
+		Supi:           "imsi-audit",
+		ReservedQuota:  map[int32]int64{},
+		RatingType:     map[int32]cd.RequestSubType{},
+		AcctRequestNum: map[int32]uint32{}, UsageRemainder: map[int32]*big.Rat{},
+	}
+	self.UePool.Store(ue.Supi, ue)
+	defer self.UePool.Delete(ue.Supi)
+	req := models.Chf_ConvCharging_ChargingDataRequest{SubscriberIdentifier: ue.Supi}
+	for _, rg := range []int32{1, 2} {
+		req.MultipleUnitUsage = append(req.MultipleUnitUsage, models.Chf_ConvCharging_MultipleUnitUsage{
+			RatingGroup: rg,
+			UsedUnitContainer: []models.Chf_ConvCharging_UsedUnitContainer{{
+				QuotaManagementIndicator: models.Chf_ConvCharging_QuotaManagementIndicator_ONLINE_CHARGING, TotalVolume: 10,
+			}},
+		})
+	}
+	paid := map[uint32]int{}
+	for attempt := 1; attempt <= 2; attempt++ {
+		_, problem := settleRelease(ue, "session", req, func(
+			one models.Chf_ConvCharging_ChargingDataRequest,
+		) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
+			return reserveWithPeers(one, func(_ *ctx.ChfUe, r *cd.ServiceUsageRequest) (*cd.ServiceUsageResponse, error) {
+				sr := r.ServiceRating
+				if sr.ServiceIdentifier == 2 && attempt == 1 && sr.RequestSubType == cd.REQ_SUBTYPE_DEBIT {
+					return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{}}, nil
+				}
+				return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{
+					Price:          &sr.ConsumedUnits,
+					MonetaryTariff: &cd.MonetaryTariff{RateElement: &cd.RateElement{UnitCost: &cd.UnitCost{ValueDigits: 1}}},
+				}}, nil
+			}, func(_ *ctx.ChfUe, r *cd.AccountDebitRequest) (*cd.AccountDebitResponse, error) {
+				cc := r.MultipleServicesCreditControl
+				paid[uint32(cc.RatingGroup)] += int(cc.UsedServiceUnit.CCTotalOctets)
+				return &cd.AccountDebitResponse{}, nil
+			})
+		})
+		if attempt == 1 {
+			require.NotNil(t, problem)
+			require.Zero(t, paid[2])
+			require.Equal(t, 10, paid[1])
+		} else {
+			require.Nil(t, problem)
+		}
+	}
+	require.Equal(t, 10, paid[uint32(2)])
+	require.Equal(t, 10, paid[uint32(1)], "first group should be debited once")
+}
+
+func TestMissingDebitPrice(t *testing.T) {
+	p, err := tariff.New(1, 0)
+	require.NoError(t, err)
+	_, err = ratedUnits(p, 1, &cd.ServiceUsageRequest{}, 10, cd.REQ_SUBTYPE_DEBIT,
+		func(*cd.ServiceUsageRequest) (*cd.ServiceUsageResponse, error) {
+			return &cd.ServiceUsageResponse{ServiceRating: &cd.ServiceRating{}}, nil
+		})
+	require.ErrorContains(t, err, "omitted Price")
 }

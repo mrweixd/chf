@@ -16,7 +16,15 @@ import (
 	"github.com/free5gc/chf/pkg/factory"
 )
 
+// ReleaseProgress is protected by CULock and lives as long as the session record.
+type ReleaseProgress struct {
+	Fingerprint [32]byte
+	Next        int
+	Finished    bool
+}
+
 type ChfUe struct {
+	Releases     map[string]*ReleaseProgress
 	Supi         string
 	RatingGroups []int32
 

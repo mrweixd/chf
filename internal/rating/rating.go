@@ -29,6 +29,8 @@ func SendServiceUsageRequest(
 		return nil, err
 	}
 
+	defer conn.Close()
+
 	meta, ok := smpeer.FromContext(conn.Context())
 	if !ok {
 		return nil, fmt.Errorf("peer metadata unavailable")

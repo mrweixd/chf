@@ -174,10 +174,11 @@ func handleSUR() diam.HandlerFunc {
 		sua := charging_datatype.ServiceUsageResponse{
 			SessionId: sur.SessionId, EventTimestamp: datatype.Time(time.Now()), ServiceRating: rated,
 		}
-		a := m.Answer(diam.Success)
-		err = a.Marshal(&sua)
+		a, err := sua.SuccessAnswer(m)
 		if err != nil {
 			logger.RatingLog.Errorf("Marshal SUA Err: %+v:", err)
+			ratingFailure(m, c)
+			return
 		}
 
 		_, err = a.WriteTo(c)
@@ -227,6 +228,7 @@ func rateUsage(raw string, sr *charging_datatype.ServiceRating) (*charging_datat
 	if err != nil || amount > math.MaxUint32 {
 		return nil, fmt.Errorf("price exceeds Diameter range")
 	}
-	result.Price = datatype.Unsigned32(amount)
+	wirePrice := datatype.Unsigned32(amount)
+	result.Price = &wirePrice
 	return result, nil
 }

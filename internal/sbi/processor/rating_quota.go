@@ -68,9 +68,13 @@ func ratedUnits(p tariff.Price, rg int32, sur *cd.ServiceUsageRequest, units uin
 		if answer == nil || answer.ServiceRating == nil {
 			return 0, fmt.Errorf("empty rating answer")
 		}
-		n := int64(answer.ServiceRating.Price)
+		var n int64
 		if mode == cd.REQ_SUBTYPE_RESERVE {
 			n = int64(min(uint64(answer.ServiceRating.AllowedUnits), chunk))
+		} else if answer.ServiceRating.Price == nil {
+			return 0, fmt.Errorf("debit rating answer omitted Price")
+		} else {
+			n = int64(*answer.ServiceRating.Price)
 		}
 		if result > math.MaxInt64-n {
 			return 0, fmt.Errorf("rating total overflow")
