@@ -1,6 +1,7 @@
 package context
 
 import (
+	"math/big"
 	"sync"
 	"time"
 
@@ -28,7 +29,7 @@ type ChfUe struct {
 
 	// ABMF
 	ReservedQuota  map[int32]int64
-	UnitCost       map[int32]uint32
+	UsageRemainder map[int32]*big.Rat
 	AcctRequestNum map[int32]uint32
 	AbmfClient     *sm.Client
 	AbmfMux        *sm.StateMachine
@@ -73,7 +74,7 @@ func (ue *ChfUe) init() {
 	// 	log.Fatal(err)
 	// }
 	ue.ReservedQuota = make(map[int32]int64)
-	ue.UnitCost = make(map[int32]uint32)
+	ue.UsageRemainder = make(map[int32]*big.Rat)
 
 	ue.RatingChan = make(chan *diam.Message)
 	ue.AcctChan = make(chan *diam.Message)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/fiorix/go-diameter/diam"
+	"github.com/fiorix/go-diameter/diam/avp"
 	"github.com/fiorix/go-diameter/diam/datatype"
 	"github.com/fiorix/go-diameter/diam/dict"
 	"github.com/fiorix/go-diameter/diam/sm/smpeer"
@@ -50,11 +51,7 @@ func SendServiceUsageRequest(
 
 	select {
 	case m := <-ue.RatingChan:
-		var sua charging_datatype.ServiceUsageResponse
-		if errMarshal := m.Unmarshal(&sua); errMarshal != nil {
-			return nil, fmt.Errorf("failed to parse message from %v", errMarshal)
-		}
-		return &sua, nil
+		return decodeSUA(m)
 	case <-time.After(5 * time.Second):
 		return nil, fmt.Errorf("timeout: no rate answer received")
 	}
@@ -66,4 +63,26 @@ func HandleSUA(rgChan chan *diam.Message) diam.HandlerFunc {
 
 		rgChan <- m
 	}
+}
+
+func decodeSUA(m *diam.Message) (*charging_datatype.ServiceUsageResponse, error) {
+	if m == nil {
+		return nil, fmt.Errorf("nil rating answer")
+	}
+	result, err := m.FindAVP(avp.ResultCode, 0)
+	if err != nil {
+		return nil, fmt.Errorf("missing rating Result-Code: %w", err)
+	}
+	code, ok := result.Data.(datatype.Unsigned32)
+	if !ok || code != diam.Success {
+		return nil, fmt.Errorf("rating failed: result code %v", result.Data)
+	}
+	var sua charging_datatype.ServiceUsageResponse
+	if errMarshal := m.Unmarshal(&sua); errMarshal != nil {
+		return nil, fmt.Errorf("failed to parse message from %v", errMarshal)
+	}
+	if sua.ServiceRating == nil {
+		return nil, fmt.Errorf("rating answer omitted Service-Rating")
+	}
+	return &sua, nil
 }

@@ -18,11 +18,11 @@ package rf
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"math"
 	_ "net/http/pprof"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +35,7 @@ import (
 	charging_datatype "github.com/free5gc/chf/ccs_diameter/datatype"
 	charging_dict "github.com/free5gc/chf/ccs_diameter/dict"
 	"github.com/free5gc/chf/internal/logger"
+	"github.com/free5gc/chf/internal/tariff"
 	"github.com/free5gc/chf/pkg/factory"
 	"github.com/free5gc/util/mongoapi"
 )
@@ -106,23 +107,14 @@ func printErrors(ec <-chan *diam.ErrorReport) {
 // 	return diam.ListenAndServe(addr, handler, nil)
 // }
 
-func buildTaffif(unitCostStr string) *charging_datatype.MonetaryTariff {
-	// unitCost
-	unitCost := &charging_datatype.UnitCost{}
-
-	dotPos := strings.Index(unitCostStr, ".")
-	if dotPos == -1 {
-		unitCost.Exponent = datatype.Integer32(0)
-		if digit, err := strconv.Atoi(unitCostStr); err == nil {
-			unitCost.ValueDigits = datatype.Integer64(digit)
-		}
-	} else {
-		if digit, err := strconv.Atoi(strings.ReplaceAll(unitCostStr, ".", "")); err == nil {
-			unitCost.ValueDigits = datatype.Integer64(digit)
-		}
-		unitCost.Exponent = datatype.Integer32(len(unitCostStr) - dotPos - 1)
+func buildTariff(raw string) (*charging_datatype.MonetaryTariff, error) {
+	digits, exponent, err := tariff.Decimal(raw)
+	if err != nil {
+		return nil, err
 	}
-
+	unitCost := &charging_datatype.UnitCost{
+		ValueDigits: datatype.Integer64(digits), Exponent: datatype.Integer32(exponent),
+	}
 	return &charging_datatype.MonetaryTariff{
 		CurrencyCode: datatype.Unsigned32(901),
 		ScaleFactor: &charging_datatype.ScaleFactor{
@@ -133,13 +125,13 @@ func buildTaffif(unitCostStr string) *charging_datatype.MonetaryTariff {
 			CCUnitType: charging_datatype.MONEY,
 			UnitCost:   unitCost,
 		},
-	}
+	}, nil
 }
 
 func handleSUR() diam.HandlerFunc {
 	return func(c diam.Conn, m *diam.Message) {
 		var sur charging_datatype.ServiceUsageRequest
-		var monetaryCost datatype.Unsigned32
+
 		var subscriberId string
 
 		if err := m.Unmarshal(&sur); err != nil {
@@ -148,6 +140,10 @@ func handleSUR() diam.HandlerFunc {
 			return
 		}
 
+		if sur.ServiceRating == nil || sur.SubscriptionId == nil {
+			ratingFailure(m, c)
+			return
+		}
 		sr := sur.ServiceRating
 		rg := uint32(sr.ServiceIdentifier)
 
@@ -159,63 +155,25 @@ func handleSUR() diam.HandlerFunc {
 
 		filter := bson.M{"ueId": subscriberId, "ratingGroup": rg}
 		chargingInterface, err := mongoapi.RestfulAPIGetOne(chargingDatasColl, filter)
-		if err != nil {
-			logger.ChargingdataPostLog.Errorf("Get tarrif error: %+v", err)
-		}
-		if chargingInterface == nil {
-			logger.ChargingdataPostLog.Warningf(
-				"No ChargingData found for UE:[%+v] for RG:[%+v]", subscriberId, rg)
-			// Must respond SUA to avoid client-side timeout waiting for answer.
-			// When charging data is missing, return 0 quota/cost.
-			sua := charging_datatype.ServiceUsageResponse{
-				SessionId:      sur.SessionId,
-				EventTimestamp: datatype.Time(time.Now()),
-				ServiceRating: &charging_datatype.ServiceRating{
-					MonetaryTariff: buildTaffif("1"),
-					AllowedUnits:   datatype.Unsigned32(0),
-					Price:          datatype.Unsigned32(0),
-				},
-			}
-
-			a := m.Answer(diam.UnableToComply)
-			if errMarshal := a.Marshal(&sua); errMarshal != nil {
-				logger.RatingLog.Errorf("Marshal SUA Err (missing charging data): %+v:", errMarshal)
-			}
-			_, errWrite := a.WriteTo(c)
-			if errWrite != nil {
-				logger.RatingLog.Errorf("Failed to write error SUA to %s: %s\n%s\n",
-					c.RemoteAddr(), errWrite, a)
-			}
+		if err != nil || chargingInterface == nil {
+			logger.RatingLog.Error("No usable charging data")
+			ratingFailure(m, c)
 			return
 		}
-		unitCostStr := chargingInterface["unitCost"].(string)
-		monetaryTariff := buildTaffif(unitCostStr)
-		unitCost := datatype.Unsigned32(monetaryTariff.RateElement.UnitCost.ValueDigits) *
-			datatype.Unsigned32(math.Pow10(int(monetaryTariff.RateElement.UnitCost.Exponent)))
+		raw, ok := chargingInterface["unitCost"].(string)
+		if !ok {
+			ratingFailure(m, c)
+			return
+		}
+		rated, err := rateUsage(raw, sr)
+		if err != nil {
+			logger.RatingLog.Error(err)
+			ratingFailure(m, c)
+			return
+		}
 		sua := charging_datatype.ServiceUsageResponse{
-			SessionId:      sur.SessionId,
-			EventTimestamp: datatype.Time(time.Now()),
-			ServiceRating: &charging_datatype.ServiceRating{
-				MonetaryTariff: monetaryTariff,
-			},
+			SessionId: sur.SessionId, EventTimestamp: datatype.Time(time.Now()), ServiceRating: rated,
 		}
-
-		switch sr.RequestSubType {
-		// price for the consumed units
-		case charging_datatype.REQ_SUBTYPE_DEBIT:
-			monetaryCost = sr.ConsumedUnits * unitCost
-			sua.ServiceRating.AllowedUnits = datatype.Unsigned32(0)
-			sua.ServiceRating.Price = monetaryCost
-		// price for the reserved units
-		case charging_datatype.REQ_SUBTYPE_RESERVE:
-			sua.ServiceRating.AllowedUnits = sr.MonetaryQuota / unitCost
-			sua.ServiceRating.Price = sua.ServiceRating.AllowedUnits * unitCost
-		default:
-			logger.RatingLog.Warnf("Unknow request type")
-			sua.ServiceRating.AllowedUnits = datatype.Unsigned32(0)
-			sua.ServiceRating.Price = datatype.Unsigned32(0)
-		}
-
 		a := m.Answer(diam.Success)
 		err = a.Marshal(&sua)
 		if err != nil {
@@ -233,4 +191,42 @@ func handleSUR() diam.HandlerFunc {
 
 func handleALL(c diam.Conn, m *diam.Message) {
 	logger.RatingLog.Warnf("Received unexpected message from %s:\n%s", c.RemoteAddr(), m)
+}
+
+func ratingFailure(m *diam.Message, c diam.Conn) {
+	if _, err := m.Answer(diam.UnableToComply).WriteTo(c); err != nil {
+		logger.RatingLog.Error(err)
+	}
+}
+
+func rateUsage(raw string, sr *charging_datatype.ServiceRating) (*charging_datatype.ServiceRating, error) {
+	t, err := buildTariff(raw)
+	if err != nil {
+		return nil, err
+	}
+	cost := t.RateElement.UnitCost
+	p, err := tariff.New(int64(cost.ValueDigits), int32(cost.Exponent))
+	if err != nil {
+		return nil, err
+	}
+	result := &charging_datatype.ServiceRating{MonetaryTariff: t}
+	volume := uint64(sr.ConsumedUnits)
+	switch sr.RequestSubType {
+	case charging_datatype.REQ_SUBTYPE_DEBIT:
+	case charging_datatype.REQ_SUBTYPE_RESERVE:
+		limit := uint64(math.MaxUint32)
+		if sr.RequestedUnits != 0 {
+			limit = uint64(sr.RequestedUnits)
+		}
+		volume = p.Affordable(uint64(sr.MonetaryQuota), limit)
+		result.AllowedUnits = datatype.Unsigned32(volume)
+	default:
+		return nil, fmt.Errorf("unsupported rating request subtype")
+	}
+	amount, err := p.Charge(volume)
+	if err != nil || amount > math.MaxUint32 {
+		return nil, fmt.Errorf("price exceeds Diameter range")
+	}
+	result.Price = datatype.Unsigned32(amount)
+	return result, nil
 }

@@ -385,7 +385,12 @@ func (p *Processor) ChargingDataRelease(
 	ue.CULock.Lock()
 	defer ue.CULock.Unlock()
 
-	sessionChargingReservation(chargingData)
+	units, _ := sessionChargingReservation(chargingData)
+	for _, u := range units {
+		if u.ResultCode == models.Chf_ConvCharging_ResultCode_RATING_FAILED {
+			return &models.ProblemDetails{Status: http.StatusInternalServerError, Cause: "RATING_FAILED"}
+		}
+	}
 
 	cdr := ue.Cdr[chargingSessionId]
 
@@ -448,32 +453,18 @@ func (p *Processor) BuildConvergedChargingDataUpdateResopone(
 	return responseBody, partialRecord
 }
 
-func getUnitCost(ue *chf_context.ChfUe, rg int32, sur *charging_datatype.ServiceUsageRequest) uint32 {
-	if sur == nil {
-		logger.ChargingdataPostLog.Errorln("ServiceUsageRequest is nil, set unitCost to 1")
-		return 1
-	}
-
-	sur.ServiceRating = &charging_datatype.ServiceRating{
-		ServiceIdentifier: datatype.Unsigned32(rg),
-		MonetaryQuota:     datatype.Unsigned32(0), // dummy
-		RequestSubType:    charging_datatype.REQ_SUBTYPE_RESERVE,
-	}
-
-	serviceUsageRsp, err := rating.SendServiceUsageRequest(ue, sur)
-	if err != nil {
-		logger.ChargingdataPostLog.Errorf("err: %+v", err)
-		logger.ChargingdataPostLog.Errorln("cannot get unitCost by SendServiceUsageRequest, set unitCost to 1")
-		return 1
-	}
-
-	return uint32(serviceUsageRsp.ServiceRating.MonetaryTariff.RateElement.UnitCost.ValueDigits) *
-		uint32(math.Pow10(int(serviceUsageRsp.ServiceRating.MonetaryTariff.RateElement.UnitCost.Exponent)))
-}
-
 // 32.296 6.2.2.3.1: Service usage request method with reservation
 func sessionChargingReservation(
 	chargingData models.Chf_ConvCharging_ChargingDataRequest,
+) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
+	return reserveWithPeers(chargingData, rating.SendServiceUsageRequest, abmf.SendAccountDebitRequest)
+}
+
+func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
+	rate func(*chf_context.ChfUe, *charging_datatype.ServiceUsageRequest) (*charging_datatype.ServiceUsageResponse, error),
+	debit func(
+		*chf_context.ChfUe, *charging_datatype.AccountDebitRequest,
+	) (*charging_datatype.AccountDebitResponse, error),
 ) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
 	var multipleUnitInformation []models.Chf_ConvCharging_MultipleUnitInformation
 	var partialRecord bool
@@ -513,12 +504,15 @@ func sessionChargingReservation(
 	}
 
 	for unitUsageNum, unitUsage := range chargingData.MultipleUnitUsage {
-		var totalUsedUnit uint32
+		var totalUsedUnit uint64
+		invalidVolume := false
 		var finalUnitIndication models.Chf_ConvCharging_FinalUnitIndication
 		creditControl := false
 		finalSeen := false
 
 		rg := unitUsage.RatingGroup
+		previousType, hadType := ue.RatingType[rg]
+		previousGroups := ue.RatingGroups
 		if !ue.FindRatingGroup(rg) {
 			ue.RatingGroups = append(ue.RatingGroups, rg)
 			ue.RatingType[rg] = charging_datatype.REQ_SUBTYPE_RESERVE
@@ -562,13 +556,33 @@ func sessionChargingReservation(
 					}
 				}
 				// calculate total used unit
-				totalUsedUnit += uint32(usedUnit.TotalVolume)
+				if usedUnit.TotalVolume < 0 || totalUsedUnit > math.MaxInt64-uint64(usedUnit.TotalVolume) {
+					invalidVolume = true
+				} else {
+					totalUsedUnit += uint64(usedUnit.TotalVolume)
+				}
 			case models.Chf_ConvCharging_QuotaManagementIndicator_QUOTA_MANAGEMENT_SUSPENDED:
 				logger.ChargingdataPostLog.Errorf("Current do not support QUOTA MANAGEMENT SUSPENDED")
 			}
 		}
 		if !creditControl {
 			logger.ChargingdataPostLog.Infof("Credit Control are not required for rating group: %d", rg)
+			continue
+		}
+		failRating := func(err error) {
+			ue.RatingGroups = previousGroups
+			if hadType {
+				ue.RatingType[rg] = previousType
+			} else {
+				delete(ue.RatingType, rg)
+			}
+			logger.ChargingdataPostLog.Errorf("rating group %d: %v", rg, err)
+			multipleUnitInformation = append(multipleUnitInformation, models.Chf_ConvCharging_MultipleUnitInformation{
+				RatingGroup: rg, UPFID: unitUsage.UPFID, ResultCode: models.Chf_ConvCharging_ResultCode_RATING_FAILED,
+			})
+		}
+		if invalidVolume || (unitUsage.RequestedUnit != nil && unitUsage.RequestedUnit.TotalVolume < 0) {
+			failRating(fmt.Errorf("invalid charging volume"))
 			continue
 		}
 		// TS 32.290 Table 7.1: ONLINE usage without Requested Unit is the last
@@ -601,29 +615,43 @@ func sessionChargingReservation(
 			UserName:       datatype.OctetString(self.Name),
 		}
 
+		send := func(req *charging_datatype.ServiceUsageRequest) (*charging_datatype.ServiceUsageResponse, error) {
+			return rate(ue, req)
+		}
 		switch ue.RatingType[rg] {
 		case charging_datatype.REQ_SUBTYPE_RESERVE:
-			// If there is no requested unit, nothing to reserve / grant.
-			if unitUsage.RequestedUnit == nil || unitUsage.RequestedUnit.TotalVolume <= 0 {
-				logger.ChargingdataPostLog.Infof("No RequestedUnit for rating group: %d, skip granting", rg)
+			price, err := getUnitCost(rg, sur, send)
+			if err != nil {
+				failRating(err)
 				continue
 			}
-			var requestedQuota uint64
-
-			ue.UnitCost[rg] = getUnitCost(ue, rg, sur)
-
-			var requestedTotalVolume uint32
-			if unitUsage.RequestedUnit != nil {
-				requestedTotalVolume = uint32(unitUsage.RequestedUnit.TotalVolume)
+			requested := uint64(unitUsage.RequestedUnit.TotalVolume)
+			usedQuota, remainder, err := usageCharge(price, totalUsedUnit, ue.UsageRemainder[rg], false)
+			if err != nil {
+				failRating(err)
+				continue
 			}
-
-			usedQuota := uint64(totalUsedUnit * ue.UnitCost[rg])
-			requestedQuota = uint64(requestedTotalVolume * ue.UnitCost[rg])
-			ue.ReservedQuota[rg] -= int64(usedQuota)
-			NeedReserveQuota := ue.ReservedQuota[rg] <= 0
-
-			if NeedReserveQuota {
-				reserveQuota := -uint64(ue.ReservedQuota[rg]) + requestedQuota
+			if ue.ReservedQuota[rg] < math.MinInt64+usedQuota {
+				failRating(fmt.Errorf("reservation underflow"))
+				continue
+			}
+			balance := ue.ReservedQuota[rg] - usedQuota
+			granted, err := ratedUnits(price, rg, sur, requested, charging_datatype.REQ_SUBTYPE_RESERVE, send)
+			if err != nil {
+				failRating(err)
+				continue
+			}
+			requestedQuota, _, err := usageCharge(price, uint64(granted), remainder, true)
+			if err != nil {
+				failRating(err)
+				continue
+			}
+			if balance < requestedQuota {
+				if balance < requestedQuota-math.MaxInt64 {
+					failRating(fmt.Errorf("reservation exceeds account range"))
+					continue
+				}
+				reserveQuota := requestedQuota - balance
 				ccr.CcRequestType = charging_datatype.UPDATE_REQUEST
 				ccr.RequestedAction = charging_datatype.DIRECT_DEBITING
 				ccr.MultipleServicesCreditControl = &charging_datatype.MultipleServicesCreditControl{
@@ -633,13 +661,23 @@ func sessionChargingReservation(
 					},
 				}
 
-				acctDebitRsp, err := abmf.SendAccountDebitRequest(ue, ccr)
-				if err != nil {
-					logger.ChargingdataPostLog.Errorf("SendAccountDebitRequest err: %+v", err)
+				acctDebitRsp, debitErr := debit(ue, ccr)
+				if debitErr != nil {
+					failRating(debitErr)
 					continue
 				}
 
-				ue.ReservedQuota[rg] += int64(acctDebitRsp.MultipleServicesCreditControl.GrantedServiceUnit.CCTotalOctets)
+				if acctDebitRsp == nil || acctDebitRsp.MultipleServicesCreditControl == nil ||
+					acctDebitRsp.MultipleServicesCreditControl.GrantedServiceUnit == nil {
+					failRating(fmt.Errorf("missing granted quota"))
+					continue
+				}
+				actual := uint64(acctDebitRsp.MultipleServicesCreditControl.GrantedServiceUnit.CCTotalOctets)
+				if actual > uint64(reserveQuota) {
+					failRating(fmt.Errorf("invalid granted quota"))
+					continue
+				}
+				balance += int64(actual)
 
 				// Deduct the reserved quota from the account
 				if acctDebitRsp.MultipleServicesCreditControl.FinalUnitIndication != nil {
@@ -654,23 +692,12 @@ func sessionChargingReservation(
 				}
 			}
 
-			sur.ServiceRating = &charging_datatype.ServiceRating{
-				ServiceIdentifier: datatype.Unsigned32(rg),
-				MonetaryQuota:     datatype.Unsigned32(requestedQuota),
-				RequestSubType:    charging_datatype.REQ_SUBTYPE_RESERVE,
+			ue.ReservedQuota[rg] = balance
+			ue.UsageRemainder[rg] = remainder
+			var grantedUnit uint64
+			if balance > 0 {
+				grantedUnit = price.AffordableAfterUsage(uint64(balance), uint64(granted), remainder)
 			}
-
-			// Retrieve and save the tarrif for pricing the next usage
-			serviceUsageRsp, err := rating.SendServiceUsageRequest(ue, sur)
-			if err != nil {
-				logger.ChargingdataPostLog.Errorf("SendServiceUsageRequest err: %+v", err)
-				continue
-			}
-
-			ue.UnitCost[rg] = getUnitCost(ue, rg, sur)
-
-			grantedUnit := min(uint32(serviceUsageRsp.ServiceRating.AllowedUnits), requestedTotalVolume)
-
 			if ue.RatingType[rg] == charging_datatype.REQ_SUBTYPE_RESERVE {
 				unitInformation.Triggers = append(unitInformation.Triggers,
 					models.Chf_ConvCharging_Trigger{
@@ -731,25 +758,36 @@ func sessionChargingReservation(
 
 		case charging_datatype.REQ_SUBTYPE_DEBIT:
 			logger.ChargingdataPostLog.Info("Debit mode, will not grant unit")
-			// retrieved tarrif for final pricing
-			sur.ServiceRating = &charging_datatype.ServiceRating{
-				ServiceIdentifier: datatype.Unsigned32(rg),
-				ConsumedUnits:     datatype.Unsigned32(totalUsedUnit),
-				RequestSubType:    charging_datatype.REQ_SUBTYPE_DEBIT,
-			}
-
-			serviceUsageRsp, err := rating.SendServiceUsageRequest(ue, sur)
+			price, err := getUnitCost(rg, sur, send)
 			if err != nil {
-				logger.ChargingdataPostLog.Errorf("SendServiceUsageRequest err: %+v", err)
+				failRating(err)
 				continue
 			}
-			logger.ChargingdataPostLog.Tracef(
-				"price %+v, ue.ReservedQuota[rg]: %+v", serviceUsageRsp.ServiceRating.Price, ue.ReservedQuota[rg])
-
-			if int64(serviceUsageRsp.ServiceRating.Price) < ue.ReservedQuota[rg] {
+			finalPrice, err := ratedUnits(price, rg, sur, totalUsedUnit, charging_datatype.REQ_SUBTYPE_DEBIT, send)
+			if err != nil {
+				failRating(err)
+				continue
+			}
+			if carry := ue.UsageRemainder[rg]; carry != nil && carry.Sign() != 0 {
+				quoted, e := price.Charge(totalUsedUnit)
+				if e != nil || quoted != finalPrice {
+					failRating(fmt.Errorf("cannot reconcile fractional usage with final rating"))
+					continue
+				}
+				finalPrice, _, err = usageCharge(price, totalUsedUnit, carry, true)
+				if err != nil {
+					failRating(err)
+					continue
+				}
+			}
+			if ue.ReservedQuota[rg] < finalPrice-math.MaxInt64 {
+				failRating(fmt.Errorf("settlement exceeds account range"))
+				continue
+			}
+			if finalPrice < ue.ReservedQuota[rg] {
 				// The final consumed quota is smaller than the reserved quota
 				// Therefore, return the extra reserved quota back to the user account
-				reservedRemained := ue.ReservedQuota[rg] - int64(serviceUsageRsp.ServiceRating.Price)
+				reservedRemained := ue.ReservedQuota[rg] - finalPrice
 				ccr.RequestedAction = charging_datatype.REFUND_ACCOUNT
 				ccr.MultipleServicesCreditControl = &charging_datatype.MultipleServicesCreditControl{
 					RatingGroup: datatype.Unsigned32(rg),
@@ -765,7 +803,7 @@ func sessionChargingReservation(
 			} else {
 				// The final consumed quota exceed the reserved quota
 				// Deduct the extra consumed quota from the user account
-				extraConsumed := int64(serviceUsageRsp.ServiceRating.Price) - ue.ReservedQuota[rg]
+				extraConsumed := finalPrice - ue.ReservedQuota[rg]
 				ccr.RequestedAction = charging_datatype.DIRECT_DEBITING
 				ccr.CcRequestType = charging_datatype.TERMINATION_REQUEST
 				ccr.MultipleServicesCreditControl = &charging_datatype.MultipleServicesCreditControl{
@@ -776,12 +814,13 @@ func sessionChargingReservation(
 				}
 			}
 
-			_, err = abmf.SendAccountDebitRequest(ue, ccr)
+			_, err = debit(ue, ccr)
 			if err != nil {
-				logger.ChargingdataPostLog.Errorf("SendAccountDebitRequest err: %+v", err)
+				failRating(err)
 				continue
 			}
 			ue.ReservedQuota[rg] = 0
+			delete(ue.UsageRemainder, rg)
 
 			unitInformation.Triggers = append(unitInformation.Triggers,
 				models.Chf_ConvCharging_Trigger{
