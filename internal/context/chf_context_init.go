@@ -29,7 +29,6 @@ func InitChfContext(context *CHFContext) {
 	context.NrfCertPem = configuration.NrfCertPem
 	context.UriScheme = models.UriScheme(configuration.Sbi.Scheme)
 	context.RatingSessionIdGenerator = idgenerator.NewGenerator(1, math.MaxUint32)
-	context.AccountSessionIdGenerator = idgenerator.NewGenerator(1, math.MaxUint32)
 	context.RegisterIPv4 = factory.ChfSbiDefaultIPv4 // default localhost
 	context.SBIPort = factory.ChfSbiDefaultPort      // default port
 	if sbi != nil {

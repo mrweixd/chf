@@ -390,7 +390,18 @@ func (p *Processor) ChargingDataRelease(
 	if cdr == nil {
 		return &models.ProblemDetails{Status: http.StatusNotFound, Cause: "CONTEXT_NOT_FOUND"}
 	}
-	progress, problem := settleRelease(ue, chargingSessionId, chargingData, sessionChargingReservation)
+	progress, problem := settleRelease(ue, chargingSessionId, chargingData,
+		func(
+			entry models.Chf_ConvCharging_ChargingDataRequest, index int,
+		) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
+			return reserveWithPeers(entry, rating.SendServiceUsageRequest, func(u *chf_context.ChfUe,
+				req *charging_datatype.AccountDebitRequest,
+			) (*charging_datatype.AccountDebitResponse, error) {
+				req.SessionId = datatype.UTF8String(u.AcctSessionId + ";release;" + chargingSessionId)
+				req.CcRequestNumber = datatype.Unsigned32(index)
+				return abmf.SendAccountDebitRequest(u, req)
+			})
+		})
 	if problem != nil || progress.Finished {
 		return problem
 	}
@@ -427,7 +438,9 @@ func (p *Processor) ChargingDataRelease(
 // Called under CULock. Advance only after this entry has been settled.
 // Keep the cursor through CDR finalization so retrying cannot repeat a debit.
 func settleRelease(ue *chf_context.ChfUe, session string, req models.Chf_ConvCharging_ChargingDataRequest,
-	settle func(models.Chf_ConvCharging_ChargingDataRequest) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool),
+	settle func(
+		models.Chf_ConvCharging_ChargingDataRequest, int,
+	) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool),
 ) (*chf_context.ReleaseProgress, *models.ProblemDetails) {
 	key, err := json.Marshal([]any{req.InvocationSequenceNumber, req.MultipleUnitUsage, req.Triggers})
 	if err != nil {
@@ -448,7 +461,7 @@ func settleRelease(ue *chf_context.ChfUe, session string, req models.Chf_ConvCha
 	entries := req.MultipleUnitUsage
 	for p.Next < len(entries) {
 		req.MultipleUnitUsage = entries[p.Next : p.Next+1]
-		units, _ := settle(req)
+		units, _ := settle(req, p.Next)
 		for _, u := range units {
 			if u.ResultCode == models.Chf_ConvCharging_ResultCode_RATING_FAILED {
 				return nil, &models.ProblemDetails{Status: http.StatusInternalServerError, Cause: "RATING_FAILED"}
@@ -634,7 +647,7 @@ func reserveWithPeers(chargingData models.Chf_ConvCharging_ChargingDataRequest,
 		}
 
 		ccr := &charging_datatype.AccountDebitRequest{
-			SessionId:       datatype.UTF8String(strconv.Itoa(int(ue.AcctSessionId))),
+			SessionId:       datatype.UTF8String(ue.AcctSessionId),
 			OriginHost:      datatype.DiameterIdentity(self.AbmfCfg.OriginHost),
 			OriginRealm:     datatype.DiameterIdentity(self.AbmfCfg.OriginRealm),
 			EventTimestamp:  datatype.Time(time.Now()),

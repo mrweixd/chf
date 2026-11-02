@@ -45,8 +45,7 @@ type CHFContext struct {
 	RatingCfg *sm.Settings
 	AbmfCfg   *sm.Settings
 
-	RatingSessionIdGenerator  *idgenerator.IDGenerator
-	AccountSessionIdGenerator *idgenerator.IDGenerator
+	RatingSessionIdGenerator *idgenerator.IDGenerator
 	sync.Mutex
 }
 
@@ -96,13 +95,6 @@ func (context *CHFContext) ChfUeFindBySupi(supi string) (*ChfUe, bool) {
 
 func GenerateRatingSessionId() uint32 {
 	if id, err := chfContext.RatingSessionIdGenerator.Allocate(); err == nil {
-		return uint32(id)
-	}
-	return 0
-}
-
-func GenerateAccountSessionId() uint32 {
-	if id, err := chfContext.AccountSessionIdGenerator.Allocate(); err == nil {
 		return uint32(id)
 	}
 	return 0

@@ -29,6 +29,7 @@ func SendAccountDebitRequest(
 		return nil, err
 	}
 
+	defer conn.Close()
 	meta, ok := smpeer.FromContext(conn.Context())
 	if !ok {
 		return nil, fmt.Errorf("peer metadata unavailable")
@@ -50,16 +51,26 @@ func SendAccountDebitRequest(
 			conn.RemoteAddr(), err)
 	}
 
-	select {
-	case m := <-ue.AcctChan:
-		var cca charging_datatype.AccountDebitResponse
-		if errMarshal := m.Unmarshal(&cca); err != nil {
-			return nil, fmt.Errorf("failed to parse message from %v", errMarshal)
-		}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case m := <-ue.AcctChan:
+			if m == nil || m.Header.HopByHopID != msg.Header.HopByHopID || m.Header.EndToEndID != msg.Header.EndToEndID {
+				continue
+			}
+			var cca charging_datatype.AccountDebitResponse
+			if errMarshal := m.Unmarshal(&cca); errMarshal != nil {
+				return nil, fmt.Errorf("failed to parse message from %v", errMarshal)
+			}
 
-		return &cca, nil
-	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("timeout: no rate answer received")
+			if cca.ResultCode != diam.Success || cca.SessionId != ccr.SessionId || cca.CcRequestNumber != ccr.CcRequestNumber {
+				return nil, fmt.Errorf("invalid account response: result %d", cca.ResultCode)
+			}
+			return &cca, nil
+		case <-timer.C:
+			return nil, fmt.Errorf("timeout: no account answer received")
+		}
 	}
 }
 

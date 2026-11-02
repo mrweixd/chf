@@ -153,7 +153,7 @@ func TestReleaseRetry(t *testing.T) {
 	paid := map[uint32]int{}
 	for attempt := 1; attempt <= 2; attempt++ {
 		_, problem := settleRelease(ue, "session", req, func(
-			one models.Chf_ConvCharging_ChargingDataRequest,
+			one models.Chf_ConvCharging_ChargingDataRequest, _ int,
 		) ([]models.Chf_ConvCharging_MultipleUnitInformation, bool) {
 			return reserveWithPeers(one, func(_ *ctx.ChfUe, r *cd.ServiceUsageRequest) (*cd.ServiceUsageResponse, error) {
 				sr := r.ServiceRating

@@ -10,6 +10,7 @@ import (
 	"github.com/fiorix/go-diameter/diam/datatype"
 	"github.com/fiorix/go-diameter/diam/dict"
 	"github.com/fiorix/go-diameter/diam/sm"
+	"github.com/google/uuid"
 
 	charging_datatype "github.com/free5gc/chf/ccs_diameter/datatype"
 	"github.com/free5gc/chf/cdr/cdrType"
@@ -42,7 +43,7 @@ type ChfUe struct {
 	AbmfClient     *sm.Client
 	AbmfMux        *sm.StateMachine
 	AcctChan       chan *diam.Message
-	AcctSessionId  uint32
+	AcctSessionId  string
 
 	// Rating
 	RatingClient  *sm.Client
@@ -117,5 +118,5 @@ func (ue *ChfUe) init() {
 	}
 
 	ue.RateSessionId = GenerateRatingSessionId()
-	ue.AcctSessionId = GenerateAccountSessionId()
+	ue.AcctSessionId = uuid.NewString()
 }
