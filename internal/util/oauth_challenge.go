@@ -3,6 +3,7 @@ package util
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -16,21 +17,18 @@ const scopeVerificationFailure = "OAuth scope verification failed: insufficient 
 // oauthChallenge converts an OAuth verification error to the R17/RFC6750
 // Bearer response. It does not interpret JWT claims or verify any token: the
 // NFContext.AuthorizationCheck call must perform that work first.
-func oauthChallenge(r *http.Request, serviceName, authorization string, authErr error) (int, string, string) {
+func oauthChallenge(r *http.Request, serviceName, authorization string, authErr error, baseURI string) (int, string, string) {
 	if authErr == nil {
 		return 0, "", ""
 	}
 
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	host := r.Host
-	if host == "" {
-		host = r.URL.Host
-	}
-	if host == "" {
-		host = "localhost"
+	// Use a trusted advertised URI, never client-controlled Host.
+	uri, parseErr := url.Parse(baseURI)
+	if parseErr != nil || uri == nil || uri.Host == "" ||
+		(uri.Scheme != "http" && uri.Scheme != "https") {
+		baseURI = "http://localhost"
+	} else {
+		baseURI = uri.Scheme + "://" + uri.Host
 	}
 
 	// The challenge realm identifies the *service* API URI rather than the
@@ -42,7 +40,7 @@ func oauthChallenge(r *http.Request, serviceName, authorization string, authErr 
 			root = "/" + parts[0] + "/" + parts[1]
 		}
 	}
-	realm := fmt.Sprintf("%s://%s%s", scheme, host, root)
+	realm := fmt.Sprintf("%s%s", baseURI, root)
 	challenge := "Bearer realm=" + strconv.Quote(realm)
 
 	fields := strings.Fields(authorization)
