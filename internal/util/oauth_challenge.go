@@ -17,7 +17,9 @@ const scopeVerificationFailure = "OAuth scope verification failed: insufficient 
 // oauthChallenge converts an OAuth verification error to the R17/RFC6750
 // Bearer response. It does not interpret JWT claims or verify any token: the
 // NFContext.AuthorizationCheck call must perform that work first.
-func oauthChallenge(r *http.Request, serviceName, authorization string, authErr error, baseURI string) (int, string, string) {
+func oauthChallenge(
+	r *http.Request, serviceName, authorization string, authErr error, baseURI string,
+) (int, string, string) {
 	if authErr == nil {
 		return 0, "", ""
 	}
