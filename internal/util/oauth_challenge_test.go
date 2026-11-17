@@ -11,11 +11,11 @@ import (
 
 func TestOAuthChallenge(t *testing.T) {
 	tests := []struct {
-		name string
-		auth string
-		errText string
-		status int
-		want string
+		name      string
+		auth      string
+		errText   string
+		status    int
+		want      string
 		forbidden string
 	}{
 		{"missing", "", "verify OAuth Authorization header invalid", http.StatusUnauthorized,
