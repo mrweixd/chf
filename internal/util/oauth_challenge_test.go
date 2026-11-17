@@ -10,90 +10,39 @@ import (
 )
 
 func TestOAuthChallenge(t *testing.T) {
-	tests := []struct {
-		name      string
-		auth      string
-		errText   string
-		status    int
-		want      string
-		forbidden string
-	}{
-		{
-			name: "missing",
-			errText: "verify OAuth Authorization header invalid",
-			status: http.StatusUnauthorized,
-			want: `Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`,
-			forbidden: "error=",
-		},
-		{
-			name: "other-scheme",
-			auth: "Basic abc",
-			errText: "verify OAuth Authorization header invalid",
-			status: http.StatusUnauthorized,
-			want: `Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`,
-			forbidden: "error=",
-		},
-		{
-			name: "bearer-no-token",
-			auth: "Bearer",
-			errText: "verify OAuth Authorization header invalid",
-			status: http.StatusUnauthorized,
-			want: `Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`,
-			forbidden: "error=",
-		},
-		{
-			name: "bearer-prefix",
-			auth: "BearerXYZ abc",
-			errText: "verify OAuth Authorization header invalid",
-			status: http.StatusUnauthorized,
-			want: `Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`,
-			forbidden: "error=",
-		},
-		{
-			name: "invalid",
-			auth: "Bearer invalid",
-			errText: "verify OAuth parse: malformed",
-			status: http.StatusUnauthorized,
-			want: `error="invalid_token"`,
-			forbidden: "insufficient_scope",
-		},
-		{
-			name: "scope",
-			auth: "Bearer valid-but-other-scope",
-			errText: scopeVerificationFailure,
-			status: http.StatusForbidden,
-			want: `error="insufficient_scope", scope="npcf-smpolicycontrol"`,
-			forbidden: "invalid_token",
-		},
-		{
-			name: "partial-wording-failclosed",
-			auth: "Bearer valid",
-			errText: scopeVerificationFailure + " extra",
-			status: http.StatusUnauthorized,
-			want: `error="invalid_token"`,
-			forbidden: "insufficient_scope",
-		},
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet,
+		"http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/sm-policies/unknown", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			r, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
-				"http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/sm-policies/unknown", nil)
-			if err != nil {
-				t.Fatal(err)
+	check := func(name, authorization, message string, expected int, required, forbidden string) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			status, header, _ := oauthChallenge(
+				req, "npcf-smpolicycontrol", authorization, errors.New(message),
+				"http://pcf.free5gc.org:8000",
+			)
+			if status != expected {
+				t.Fatalf("status = %d; want %d", status, expected)
 			}
-			status, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", tc.auth, errors.New(tc.errText),
-				"http://pcf.free5gc.org:8000")
-			if status != tc.status {
-				t.Fatalf("status: got %d want %d", status, tc.status)
-			}
-			if !strings.Contains(header, tc.want) {
-				t.Fatalf("header %q lacks %q", header, tc.want)
-			}
-			if strings.Contains(header, tc.forbidden) {
-				t.Fatalf("header %q contains %q", header, tc.forbidden)
+			if !strings.Contains(header, required) || strings.Contains(header, forbidden) {
+				t.Fatalf("header %q; want %q and no %q", header, required, forbidden)
 			}
 		})
 	}
+	challenge := `Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`
+	check("missing", "", "missing bearer", http.StatusUnauthorized, challenge, `error=`)
+	check("other-scheme", "Basic abc", "invalid bearer", http.StatusUnauthorized, challenge, `error=`)
+	check("bare-bearer", "Bearer", "invalid bearer", http.StatusUnauthorized, challenge, `error=`)
+	check("bearer-prefix", "BearerXYZ abc", "invalid bearer", http.StatusUnauthorized, challenge, `error=`)
+	check("invalid", "Bearer invalid", "verify OAuth parse: malformed", http.StatusUnauthorized,
+		`error="invalid_token"`, `insufficient_scope`)
+	check("scope", "Bearer other.scope", scopeVerificationFailure, http.StatusForbidden,
+		`error="insufficient_scope", scope="npcf-smpolicycontrol"`, `invalid_token`)
+	check("partial-error", "Bearer invalid", scopeVerificationFailure+" extra", http.StatusUnauthorized,
+		`error="invalid_token"`, `insufficient_scope`)
 }
 
 func TestChallengeIgnoresAttackerHost(t *testing.T) {
