@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net/http"
@@ -10,9 +11,12 @@ import (
 
 func TestOAuthChallenge(t *testing.T) {
 	tests := []struct {
-		name, auth, errText string
-		status              int
-		want, forbidden     string
+		name string
+		auth string
+		errText string
+		status int
+		want string
+		forbidden string
 	}{
 		{"missing", "", "verify OAuth Authorization header invalid", http.StatusUnauthorized,
 			`Bearer realm="http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1"`, "error="},
@@ -31,12 +35,13 @@ func TestOAuthChallenge(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := http.NewRequest(http.MethodGet,
+			r, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 				"http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/sm-policies/unknown", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			status, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", tc.auth, errors.New(tc.errText), "http://pcf.free5gc.org:8000")
+			status, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", tc.auth, errors.New(tc.errText),
+				"http://pcf.free5gc.org:8000")
 			if status != tc.status {
 				t.Fatalf("status: got %d want %d", status, tc.status)
 			}
@@ -51,16 +56,25 @@ func TestOAuthChallenge(t *testing.T) {
 }
 
 func TestChallengeIgnoresAttackerHost(t *testing.T) {
-	r, _ := http.NewRequest(http.MethodGet, "http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/invalid", nil)
+	r, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet,
+		"http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/invalid", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r.Host = "attacker.example"
-	_, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", "", errors.New("missing"), "http://pcf.free5gc.org:8000")
+	_, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", "", errors.New("missing"),
+		"http://pcf.free5gc.org:8000")
 	if strings.Contains(header, "attacker.example") || !strings.Contains(header, "pcf.free5gc.org:8000") {
 		t.Fatalf("unsafe realm: %q", header)
 	}
 }
 
 func TestOAuthChallengeNilAndHTTPS(t *testing.T) {
-	r, err := http.NewRequest(http.MethodGet, "https://udr.free5gc.org:8000/nudr-dr/v2/lookup", nil)
+	r, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet, "https://udr.free5gc.org:8000/nudr-dr/v2/lookup", nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
