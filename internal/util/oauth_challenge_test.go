@@ -36,7 +36,7 @@ func TestOAuthChallenge(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			status, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", tc.auth, errors.New(tc.errText))
+			status, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", tc.auth, errors.New(tc.errText), "http://pcf.free5gc.org:8000")
 			if status != tc.status {
 				t.Fatalf("status: got %d want %d", status, tc.status)
 			}
@@ -50,17 +50,26 @@ func TestOAuthChallenge(t *testing.T) {
 	}
 }
 
+func TestChallengeIgnoresAttackerHost(t *testing.T) {
+	r, _ := http.NewRequest(http.MethodGet, "http://pcf.free5gc.org:8000/npcf-smpolicycontrol/v1/invalid", nil)
+	r.Host = "attacker.example"
+	_, header, _ := oauthChallenge(r, "npcf-smpolicycontrol", "", errors.New("missing"), "http://pcf.free5gc.org:8000")
+	if strings.Contains(header, "attacker.example") || !strings.Contains(header, "pcf.free5gc.org:8000") {
+		t.Fatalf("unsafe realm: %q", header)
+	}
+}
+
 func TestOAuthChallengeNilAndHTTPS(t *testing.T) {
 	r, err := http.NewRequest(http.MethodGet, "https://udr.free5gc.org:8000/nudr-dr/v2/lookup", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.TLS = &tls.ConnectionState{}
-	status, header, _ := oauthChallenge(r, "nudr-dr", "Bearer bad", errors.New("invalid"))
+	status, header, _ := oauthChallenge(r, "nudr-dr", "Bearer bad", errors.New("invalid"), "https://udr.free5gc.org:8000")
 	if status != 401 || !strings.Contains(header, `realm="https://udr.free5gc.org:8000/nudr-dr/v2"`) {
 		t.Fatalf("HTTPS/version realm: status=%d header=%q", status, header)
 	}
-	status, header, reason := oauthChallenge(r, "nudr-dr", "", nil)
+	status, header, reason := oauthChallenge(r, "nudr-dr", "", nil, "https://udr.free5gc.org:8000")
 	if status != 0 || header != "" || reason != "" {
 		t.Fatalf("unexpected response on nil error")
 	}
